@@ -1,16 +1,25 @@
-
-
 #include "SPI.h"
 #include "SPI_MSTransfer_MASTER.h"
 #include <FlexCAN_T4.h>
+#include "temp_lookup.h"
+#include <SD.h>
+
+/* Free rtos includes */
+#include <FreeRTOSConfig.h>
+#include <FreeRTOS.h>
+#include <task.h>
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 //FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> Can2;
 CAN_message_t msg;
 SPI_MSTransfer_MASTER<&SPI, 10, 0x1235> mySPI1235;
 
+/* Freertos definitions */
+TaskHandle_t pxBMSTaskHandle;
+void vBMSTask(void * pvParameters);
+
 void setup() {
-  Serial.begin(115200);
+  //Serial.begin(115200);
   SPI.begin();
   pinMode(0, OUTPUT);
   pinMode(33, OUTPUT);
@@ -37,14 +46,14 @@ void setup() {
   msg.flags.reserved = 0;
   Can0.mailboxStatus(); 
   
+  xTaskCreate(vBMSTask, "BMS", 4096, nullptr, 5, &pxBMSTaskHandle);
+
+  /** @note Execution doesn't go beyond scheduler */
+  vTaskStartScheduler();
+
+  for(;;) {}
+    
 }
-
-int8_t lookup[58] = {120, 110, 100, 93, 85, 80, 77, 73, 68, 65, 62, 59, 56, 54, 
-        51, 49, 46, 44, 42, 40, 38, 37, 35, 33, 32, 30, 28, 27, 25, 
-        23, 22, 20, 19, 17, 16, 14, 13, 11, 9, 7, 6, 4, 2, 1, -1, 
-        -2, -4, -6, -9, -11, -13, -15, -18, -22, -25, -30, -35, -40};
-
-
 
 void SendMessage(unsigned id, uint8_t value) {
 
@@ -53,7 +62,6 @@ void SendMessage(unsigned id, uint8_t value) {
     msg.id = id;
     msg.flags.extended = 0;
     msg.len = 1;
-    
     msg.buf[0] = value;
 
     Can0.write(msg);
@@ -68,98 +76,162 @@ void SendMessage(unsigned id, uint8_t* value, int len) {
     {
         return;
     }
-    
     msg.id = id;
     msg.flags.extended = 0;
     msg.len = 1;
-    
     for (int i=0; i<len; i++)
     {
       msg.buf[i] = value[i];
     }
-
     Can0.write(msg);
 }
 
+void WriteToSD(const CAN_message_t &msg, const char* fname){
+    static char buffer[100];
+
+    if (!SD.begin(BUILTIN_SDCARD)) {
+      return;
+    }
+
+    CAN2Str(msg, buffer, 100);
+
+    File dataFile = SD.open(fname, FILE_WRITE);
+    // if the file is available, write to it:
+    if (dataFile) {
+      dataFile.println(buffer);
+      dataFile.close();
+    }
+
+}
+
+void WriteToSD(const char* dataString, const char* fname){
+    if (!SD.begin(BUILTIN_SDCARD)) {
+        return;
+    }
+
+    if (dataString == NULL || fname == NULL) {
+        return;
+    }
+
+    File dataFile = SD.open(fname, FILE_WRITE);
+    // if the file is available, write to it:
+    if (dataFile) {
+      dataFile.println(dataString);
+      dataFile.close();
+    }
+
+}
+
+void CAN2Str(const CAN_message_t &msg, char *buffer, size_t len) {
+
+    snprintf(buffer, len, "MB:%d OVERRUN:%d LEN:%d EXT:%d TS:%05d ID:%04lX BUFFER: ", 
+              msg.mb, msg.flags.overrun, msg.len, msg.flags.extended, 
+              msg.timestamp, msg.id);
+    
+    /* Adding char '0' to numeric returns ascii value */
+    char tmpBuf[msg.len] = {0};
+    for ( uint8_t i = 0; i < msg.len; i++ ) {
+        tmpBuf[i] = msg.buf[i] + '0';
+    }
+
+    /* Append to buffer */
+    strncat(buffer, tmpBuf, msg.len);
+
+}
+
+void loop() {}
 
 #define DEBUG_ADDR 0x69
+int counter = 0;
 uint8_t debug_buffer[8] = {0};
+uint16_t address[7] = {0x00, 0x800, 0x1000, 0x1800, 0x2000, 0x2800, 0x3000};
 
+void vBMSTask(__attribute__((unused)) void * pvParameters) {
+	
+	/* Free rtos execution rate */
+	TickType_t xLastWakeTime;
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+    const TickType_t ImplausibilityTime = pdMS_TO_TICKS(100);
+	
+	// Initialise the xLastWakeTime variable with the current time.
+    xLastWakeTime = xTaskGetTickCount();
 
-void loop() {
+		// Infinite loop
+   for( ;; )
+    {
+	
   int min = 0;
   int max = 0;
-  //Min and Max ID might need to be uint8_t or 16
+  int sum = 0;
   uint8_t MinChanID = 0;
   uint8_t MaxChanID = 0;
-  int sum = 0;
   uint8_t average = 0;
-  uint16_t rxbuff = 0x0;
   uint8_t temp = 0;
+  uint16_t rxbuff = 0x0;
   for (int i = 0; i < 7; i++){
-    uint16_t txbuff = 0;
+    uint16_t txbuff = address[i];
     rxbuff = mySPI1235.transfer16(&txbuff, 1, 1);
     rxbuff = (rxbuff >> 4) & 0xff;
-    // Serial.println(i);
-    // Serial.println(rxbuff);
+    //Serial.println(i);
+    //Serial.println(rxbuff);
     //SendMessage(DEBUG_ADDR+1, i);
     //SendMessage(DEBUG_ADDR+4, rxbuff);
-    //For 26 deg C the batteries voltage output was 0.64 Volts
+    
+    //This section forces rxbuff to be within our array size
+    int index = rxbuff - 65; 
+    if (index < 0){
+      index = 0;
+    }
+    if (index > 57){
+      index = 57;
+    }
 
-
-    delay(500);
-    uint8_t temp = lookup[rxbuff - 65];
-    //uint8_t temp = 50;
+    uint8_t temp = lookup[index];
     if (i == 0){
       min = temp;
       max = temp;
-      MinChanID = i >> 11;
-      MaxChanID = i >> 11;
+      MinChanID = i;
+      MaxChanID = i;
     }
     if (temp < min){
       min = temp;
-      MinChanID = i >> 11;
+      MinChanID = i;
     }
     if (temp > max){
       max = temp;
-      MaxChanID = i >> 11;
+      MaxChanID = i;
     }
     sum = sum + temp;
-    average = sum/7;
-    uint8_t checksum = (0x01 + 0x01 + rxbuff + rxbuff + rxbuff);//min + max + average);
-    msg.buf[0] = 0x00;//  rxbuff(0x00)  Thermistor module number
-    msg.buf[1] = rxbuff; //min;
-    msg.buf[2] = rxbuff; //max;
-    msg.buf[3] = rxbuff; //average;
-    msg.buf[4] = 0x07;//Number of thermistors enabled   (7)
-    msg.buf[5] = 0x01;//Highest thermistor ID on the module
-    msg.buf[6] = 0x00;//Lowest thermistor ID on the module
-    msg.buf[7] = (checksum + 0x39 + 0x08);
 
-    Can0.write(msg);
-    // //Serial.println("Can sent");
-    
-    Can0.events();
-
-
-  }
-
-  /* average = sum/7;
+  average = sum/7;
   uint8_t checksum = (0x01 + 0x01 + rxbuff + rxbuff + rxbuff);//min + max + average);
+
+  //How do we want to display which channel is the hottest?
   msg.buf[0] = 0x00;//  rxbuff(0x00)  Thermistor module number
-  msg.buf[1] = rxbuff; //min;
-  msg.buf[2] = rxbuff; //max;
-  msg.buf[3] = rxbuff; //average;
+  msg.buf[1] = min; //min;
+  msg.buf[2] = max; //max;
+  msg.buf[3] = average; //average;
   msg.buf[4] = 0x07;//Number of thermistors enabled   (7)
   msg.buf[5] = 0x01;//Highest thermistor ID on the module
   msg.buf[6] = 0x00;//Lowest thermistor ID on the module
   msg.buf[7] = (checksum + 0x39 + 0x08);
 
   Can0.write(msg);
-  // //Serial.println("Can sent");
-  
   Can0.events();
-   */
+  counter += 1;
+  if (counter >= 100){
+    WriteToSD(msg, "CanLogger.txt");
+    counter = 0;
+  }
+  
+  }
+  
+  //BMS expects CAN message every 100 ms
+  vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+	} // end of infinite loop
+	
+	// bad if outside infinite loop 
+	configASSERT(NULL);
   
 }
-
